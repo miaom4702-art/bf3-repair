@@ -211,6 +211,22 @@ if (Test-Path $licDir) {
     else { Bad "EA Services\License 下没有 BF3 的授权文件（70619.dlf / 71067.dlf）→ 从未成功授权" }
 } else { Warn "找不到 EA Services\License 目录" }
 
+# ---- 残留启动器进程（本机实测：会导致新启动被锁死）----
+Write-Head "3c. EA 启动器残留进程"
+$staleNames = @('EASteamLauncher','EALaunchHelper','EASteamAuthHelper','EASteamProxy','EALocalHostSvc')
+$stale = @()
+foreach ($n in $staleNames) {
+    $p = Get-Process $n -ErrorAction SilentlyContinue
+    if ($p) { $stale += "$n(PID $($p.Id -join ','))" }
+}
+if ($stale.Count -eq 0) {
+    Ok '没有残留的 EA 启动器进程'
+} else {
+    Warn "发现 $($stale.Count) 个启动器进程：$($stale -join ', ')"
+    Info '这些实例会让新的启动请求报 "Another instance of EASteamLauncher is already running" 后静默退出'
+    Info '修复：运行 .\BF3-Play.ps1（启动前会自动清理），或手动结束这些进程'
+}
+
 # ---------------------------------------------------------------- 4 注册表
 Write-Head "4. 游戏注册表"
 foreach ($k in @('HKLM:\SOFTWARE\WOW6432Node\EA Games\Battlefield 3','HKLM:\SOFTWARE\EA Games\Battlefield 3')) {

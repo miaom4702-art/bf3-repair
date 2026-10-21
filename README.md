@@ -13,21 +13,46 @@ BF3 在 Steam 上（appid `1238820`）经常出现**点了没反应**：Steam �
 游戏从未真正运行过。网上流传的原因五花八门（重装 VC++、修注册表、换节点、重装 EA App……），
 但绝大多数人从来没定位到真正的断点在哪。
 
-本项目把这类故障拆成**可验证的检查项**逐条测量，最终指向一个很具体、也很容易被忽略的原因：
+本项目把这类故障拆成**可验证的检查项**逐条测量，最终定位到**两个叠加的原因**：
 
-> **EA 自己的"安装登记簿"里写的是一个已经不存在的旧路径。**
+> **A. EA 自己的"安装登记簿"里写着一个已经不存在的旧路径。**
+> **B. 残留的 `EASteamLauncher` 实例会把新的启动请求锁死，然后静默退出 —— 这才是"点了没反应"的直接原因。**
+
+### 根因 A：安装登记簿指向旧地址
 
 EA 通过 `C:\ProgramData\Origin\LocalContent\Battlefield 3\*.dat` 判断游戏装在哪、装全了没。
 如果这些清单里的路径（例如 `C:\Program Files (x86)\Origin Games\Battlefield 3`）和游戏实际位置
-（例如 `D:\SteamLibrary\steamapps\common\Battlefield 3`）不一致，EA App 就找不到文件 →
-不签发授权票据 → `bf3.exe` 拿不到票 → **静默退出（退出码 0）**。
-如果此时负责弹错误框的 `MessageDlg.exe` 又缺失，用户连个错误提示都看不到，于是表现为"完全没反应"。
+不一致，EA App 就找不到文件。`HKLM\...\Origin Games\70619` / `71067` 也缺 `Install Dir`。
+`BF3-Repair-EA.ps1` 用目录联接修掉这一层。
+
+### 根因 B：残留启动器实例锁死新启动（关键）
+
+EA 的启动接力链是：
+
+```
+Steam / BF3WebHelper.exe
+   → EA Desktop（收到 origin://LaunchGame/70619,71067...?ProductId=DR:225064100）
+   → EASteamLauncher.exe
+   → 打开 Battlelog 网页 https://battlelog.battlefield.com/bf3/
+   → 网页里通过 origin:// 协议拉起 bf3.exe
+```
+
+当机器上残留着上一次的 `EASteamLauncher / EALaunchHelper / EASteamAuthHelper` 进程时，
+带真实启动参数的新实例会这样死掉：
+
+```
+WARN  Another instance of EASteamLauncher is already running. Retrying. Attempt=[1]...[5]
+ERROR Another instance of EASteamLauncher is still running after retries. Exiting.
+```
+
+**它不乱报错，直接退出** —— 界面上就是"点了没反应"。清掉残留实例后 Battlelog 立刻正常弹出，实测有效。
+`BF3-Play.ps1` 现在会在启动前自动做这件事。
 
 **这个项目做三件事：**
 
 1. **量出来**：给出可复现的诊断，指出到底哪一环断了，而不是让你挨个试偏方。
-2. **修掉它**：在清单期望的路径上建立**目录联接（Junction）**指向真实安装目录，不改任何游戏文件、可一键撤销。
-3. **绕过去**：如果官方链路修不好，用 Venice Unleashed 起本地服务器 + AI 机器人，
+2. **修掉它**：清理残留启动器 + 修 EA 清单路径（目录联接，可一键撤销）。
+3. **绕过去**：如果官方链路彻底修不好，用 Venice Unleashed 起本地服务器 + AI 机器人，
    完全不依赖 EA 后端也能玩（这是 BF3 社区目前的通行做法）。
 
 ### 本机实测的完整证据链（供对照）
@@ -38,12 +63,11 @@ EA 通过 `C:\ProgramData\Origin\LocalContent\Battlefield 3\*.dat` 判断游戏�
 | 主程序完整性 | ✅ `bf3.exe` v1.6.0.0，**Electronic Arts 有效签名**，未被改动 |
 | VC++ 2010 / PunkBuster / 网络 | ✅ 全部正常（EA 三个授权域名均可达） |
 | EA App 进程与登录 | ✅ 已认证（`DesktopFSM[authenticated]`） |
-| **EA 内容清单路径** | ❌ 指向 `C:\Program Files (x86)\Origin Games\Battlefield 3`（**该目录不存在**） |
-| **`Origin Games\70619` / `71067`** | ❌ 两个 BF3 内容记录都**缺 `Install Dir`** |
-| Steam 启动链 | ❌ 只执行 `EAappInstaller.exe`（`EAX_LAUNCH_CLIENT=0`）→ 退出 0 → **断链**，`bf3.exe` 没被拉起 |
-| 直接运行 `bf3.exe` | ❌ **秒退，退出码 0**，无窗口、无日志、无崩溃转储 |
-| `MessageDlg.exe` | ❌ **缺失**，报错通道不可用 → 连错误框都弹不出来 |
-| Steam `LastPlayed` | `0` —— 从未成功启动过一次 |
+| BF3 授权文件 | ✅ `71067.dlf` 存在（577 字节） |
+| EA 内容清单路径 | ⚠ 指向不存在的旧路径 → 目录联接修复 |
+| **残留启动器进程** | ❌ **`Another instance of EASteamLauncher is still running` → 静默退出（真正的不响应原因）** |
+| Steam 启动链 | 只跑 `EAappInstaller.exe`（`EAX_LAUNCH_CLIENT=0`）后断链，实际仍靠 EA 的 web launch |
+| **清理后重试** | ✅ **Battlelog 页面 `https://battlelog.battlefield.com/bf3/` 正常打开** |
 
 ---
 
@@ -53,7 +77,7 @@ EA 通过 `C:\ProgramData\Origin\LocalContent\Battlefield 3\*.dat` 判断游戏�
 | --- | --- | --- |
 | **`BF3-Doctor.ps1`** | 全量诊断：安装完整性、Steam 记录、EA App 状态、**EA 内容清单与授权**、注册表、运行库、网络。默认**只读** | 默认否（`-Fix` 才改） |
 | **`BF3-Repair-EA.ps1`** | **根治**：修正 EA 内容清单路径错位 —— 建目录联接 + 补注册表 `Install Dir` + 重启 EA App | 是（需 UAC，`-Undo` 可完整回滚） |
-| **`BF3-Play.ps1`** | 启动器：EA App 认证 → Steam 拉起 → 直接拉起，逐级降级并汇报每一步结果 | 否（只启动进程） |
+| **`BF3-Play.ps1`** | 启动器：**清理残留启动器** → EA App 认证 → Steam 拉起 → 直接拉起；把"Battlelog 页面已打开"也算作启动成功 | 否（只结束残留进程、启动新进程） |
 | **`BF3-VU-Offline.ps1`** | 离线玩法：检查 VU 环境 / 生成本地机器人服务器配置 / 启动 | 只新增 `Server\` 配置与一个 `.bat` |
 | **`BF3-Common.ps1`** | 公共库：自动定位 Steam 根目录、Steam 库、BF3 安装目录、EA App（被上面脚本 dot-source） | 否 |
 
