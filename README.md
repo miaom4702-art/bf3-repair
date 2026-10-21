@@ -13,10 +13,10 @@ BF3 在 Steam 上（appid `1238820`）经常出现**点了没反应**：Steam �
 游戏从未真正运行过。网上流传的原因五花八门（重装 VC++、修注册表、换节点、重装 EA App……），
 但绝大多数人从来没定位到真正的断点在哪。
 
-本项目把这类故障拆成**可验证的检查项**逐条测量，最终定位到**两个叠加的原因**：
+本项目把这类故障拆成**可验证的检查项**逐条测量，最终定位到**两个叠加的原因**，并验证修复后启动链恢复：
 
 > **A. EA 自己的"安装登记簿"里写着一个已经不存在的旧路径。**
-> **B. 残留的 `EASteamLauncher` 实例会把新的启动请求锁死，然后静默退出 —— 这才是"点了没反应"的直接原因。**
+> **B. 残留的 `EASteamLauncher` 实例会与新启动冲突（日志里明确报错后退出）。**
 
 ### 根因 A：安装登记簿指向旧地址
 
@@ -25,7 +25,7 @@ EA 通过 `C:\ProgramData\Origin\LocalContent\Battlefield 3\*.dat` 判断游戏�
 不一致，EA App 就找不到文件。`HKLM\...\Origin Games\70619` / `71067` 也缺 `Install Dir`。
 `BF3-Repair-EA.ps1` 用目录联接修掉这一层。
 
-### 根因 B：残留启动器实例锁死新启动（关键）
+### 根因 B：残留启动器实例
 
 EA 的启动接力链是：
 
@@ -37,23 +37,32 @@ Steam / BF3WebHelper.exe
    → 网页里通过 origin:// 协议拉起 bf3.exe
 ```
 
-当机器上残留着上一次的 `EASteamLauncher / EALaunchHelper / EASteamAuthHelper` 进程时，
-带真实启动参数的新实例会这样死掉：
+当机器上残留上一次的 `EASteamLauncher / EALaunchHelper / EASteamAuthHelper` 进程时，日志里会出现：
 
 ```
 WARN  Another instance of EASteamLauncher is already running. Retrying. Attempt=[1]...[5]
 ERROR Another instance of EASteamLauncher is still running after retries. Exiting.
 ```
 
-**它不乱报错，直接退出** —— 界面上就是"点了没反应"。清掉残留实例后 Battlelog 立刻正常弹出，实测有效。
-`BF3-Play.ps1` 现在会在启动前自动做这件事。
+它会**静默退出、不弹任何错误**。`BF3-Play.ps1` 现在会在启动前自动清理这些实例。
 
-**这个项目做三件事：**
+### 验证：修复后启动链恢复
 
-1. **量出来**：给出可复现的诊断，指出到底哪一环断了，而不是让你挨个试偏方。
-2. **修掉它**：清理残留启动器 + 修 EA 清单路径（目录联接，可一键撤销）。
-3. **绕过去**：如果官方链路彻底修不好，用 Venice Unleashed 起本地服务器 + AI 机器人，
-   完全不依赖 EA 后端也能玩（这是 BF3 社区目前的通行做法）。
+三者齐备（目录联接 + 清理残留 + EA App 重新认证）后实测：
+
+```
+▶ 通过 Steam 启动 (appid 1238820)
+  ✔ Battlelog 页面已打开（tab 数 11 → 12）
+  ✔ 启动成功
+```
+
+即 EA 的 web launch 每次都会在浏览器里新开一个
+`https://battlelog.battlefield.com/bf3/?intcmp=originclient` 的 tab。
+该页面（构建版本 `140606`）目前仍然存活，带 Server Browser / Matches / Leaderboards，
+登录 EA 账号后即可从网页进入战役或多人。
+
+> ⚠️ **注意 EA 的 web launch 是「在已有窗口里新开 tab」，窗口数量不变。**
+> 本项目早期版本按"新窗口"判断，导致明明启动成功却报失败 —— 现已改为统计 tab 数。
 
 ### 本机实测的完整证据链（供对照）
 
@@ -65,9 +74,16 @@ ERROR Another instance of EASteamLauncher is still running after retries. Exitin
 | EA App 进程与登录 | ✅ 已认证（`DesktopFSM[authenticated]`） |
 | BF3 授权文件 | ✅ `71067.dlf` 存在（577 字节） |
 | EA 内容清单路径 | ⚠ 指向不存在的旧路径 → 目录联接修复 |
-| **残留启动器进程** | ❌ **`Another instance of EASteamLauncher is still running` → 静默退出（真正的不响应原因）** |
-| Steam 启动链 | 只跑 `EAappInstaller.exe`（`EAX_LAUNCH_CLIENT=0`）后断链，实际仍靠 EA 的 web launch |
-| **清理后重试** | ✅ **Battlelog 页面 `https://battlelog.battlefield.com/bf3/` 正常打开** |
+| 残留启动器进程 | ⚠ 会出现 `Another instance of EASteamLauncher` → 自动清理 |
+| 直接运行 `bf3.exe` | ℹ️ 退出码 0 —— **属正常**，它只是 Battlelog 的启动器 |
+| **修复后启动** | ✅ **Battlelog 页面每次正常新开 tab** |
+
+**这个项目做三件事：**
+
+1. **量出来**：给出可复现的诊断，指出到底哪一环断了，而不是让你挨个试偏方。
+2. **修掉它**：清理残留启动器 + 修 EA 清单路径（目录联接，可一键撤销）。
+3. **绕过去**：如果官方链路彻底修不好（或 Battlelog 哪天关停），用 Venice Unleashed
+   起本地服务器 + AI 机器人，完全不依赖 EA 后端也能玩 —— 这是 BF3 社区目前的通行做法。
 
 ---
 

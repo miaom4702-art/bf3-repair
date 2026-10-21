@@ -60,13 +60,36 @@ function No([string]$m)   { Write-Host "  ✖ $m" -ForegroundColor Red }
 function Hint([string]$m) { Write-Host "  · $m" -ForegroundColor Gray }
 function Info2([string]$m){ Write-Host "  $m" -ForegroundColor Gray }
 
-function Get-BattlelogWindow {
-    <# 找浏览器里的 Battlelog 窗口（EA 启动链的终点）#>
-    foreach ($bn in @('msedge','chrome','firefox')) {
-        $p = Get-Process $bn -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -like '*Battlelog*' -or $_.MainWindowTitle -like '*Battlefield 3*' }
-        if ($p) { return $p | Select-Object -First 1 }
+function Get-BattlelogTabCount {
+    <#
+      统计所有浏览器里 Battlelog 相关的 tab 数量。
+      注意：EA 的 web launch 是在**已有窗口里新开一个 tab**，窗口数量不变，
+      所以必须数 tab，不能数窗口 —— 这个坑实测踩过（会误报启动失败）。
+    #>
+    try {
+        Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes -ErrorAction SilentlyContinue
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $n = 0
+        foreach ($bn in @('msedge','chrome','firefox')) {
+            $procs = Get-Process $bn -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
+            foreach ($p in $procs) {
+                $cond = New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $p.Id)
+                $win = $root.FindFirst([System.Windows.Automation.TreeScope]::Children, $cond)
+                if (-not $win) { continue }
+                $tabCond = New-Object System.Windows.Automation.PropertyCondition(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::TabItem)
+                foreach ($t in $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabCond)) {
+                    $name = $t.Current.Name
+                    if ($name -like '*Battlelog*' -or $name -like '*Battlefield 3*') { $n++ }
+                }
+            }
+        }
+        return $n
+    } catch {
+        return -1   # UI Automation 不可用时返回 -1，调用方据此降级判断
     }
-    return $null
 }
 
 function Clear-EALaunchers {
@@ -84,21 +107,28 @@ function Clear-EALaunchers {
     return $killed
 }
 
-function Test-Launched([int]$seconds) {
-    <# 监控：bf3.exe 起来 或 Battlelog 页面弹出，都算成功 #>
+function Test-Launched([int]$seconds, [int]$baselineTabs = -1) {
+    <#
+      判断成功的标准（任一满足）：
+        1. bf3.exe 进程出现；
+        2. Battlelog 的 tab 数比启动前增加（EA 的 web launch 成功）；
+        3. 拿不到 tab 数时，退化为"出现新的 Battlelog 窗口"。
+    #>
     $sawGame = $false
-    $sawBattlelog = $false
+    $sawWebLaunch = $false
     for ($i = 1; $i -le [math]::Ceiling($seconds/3); $i++) {
         Start-Sleep -Seconds 3
-        $bf = Get-Process bf3 -ErrorAction SilentlyContinue
-        if ($bf) { $sawGame = $true }
-        if (-not $sawBattlelog) {
-            $bl = Get-BattlelogWindow
-            if ($bl) { $sawBattlelog = $true; Ok "Battlelog 页面已打开（$($bl.ProcessName) PID=$($bl.Id)）" }
+        if (Get-Process bf3 -ErrorAction SilentlyContinue) { $sawGame = $true }
+        if (-not $sawWebLaunch -and $baselineTabs -ge 0) {
+            $now = Get-BattlelogTabCount
+            if ($now -gt $baselineTabs) {
+                $sawWebLaunch = $true
+                Ok "Battlelog 页面已打开（tab 数 $baselineTabs → $now）"
+            }
         }
-        if ($sawGame -and $sawBattlelog) { break }
+        if ($sawGame -and ($sawWebLaunch -or $baselineTabs -lt 0)) { break }
     }
-    return [pscustomobject]@{ Game = $sawGame; Battlelog = $sawBattlelog }
+    return [pscustomobject]@{ Game = $sawGame; Battlelog = $sawWebLaunch }
 }
 
 # =====================================================================
@@ -149,27 +179,36 @@ if (-not $auth) {
     Hint '请手动打开 EA App 并登录一次，再重跑本脚本'
 }
 
+# ---------- 记录启动前的 Battlelog tab 数（用于判断本次是否真的打开了网页）----------
+$baselineTabs = Get-BattlelogTabCount
+if ($baselineTabs -ge 0) {
+    Info2 "启动前 Battlelog tab 数: $baselineTabs"
+    if ($baselineTabs -gt 3) {
+        Hint "Battlelog 已经开了 $baselineTabs 个 tab，建议关掉多余的再看结果"
+    }
+}
+
 # ---------- 尝试 1: Steam ----------
 $result = $null
 if ($Mode -in @('auto','steam')) {
     Write-Step "尝试 1/2：通过 Steam 启动 (appid $AppId)"
     Start-Process "steam://rungameid/$AppId"
     Hint "已发送启动请求，观察 $SteamTimeout 秒…"
-    $result = Test-Launched $SteamTimeout
+    $result = Test-Launched $SteamTimeout $baselineTabs
     if ($result.Game -or $result.Battlelog) {
         Write-Host ''
         Ok '启动成功（Steam 链）'
-        if ($result.Battlelog) { Hint '在打开的 Battlelog 页面登录后，即可进入战役或多人' }
+        if ($result.Battlelog) { Hint '在新打开的 Battlelog 页面登录后，即可进入战役或多人' }
         exit 0
     }
-    No 'Steam 链未能拉起游戏，也未打开 Battlelog'
+    No 'Steam 链未能拉起游戏，也未打开新的 Battlelog 页面'
 }
 
 # ---------- 尝试 2: 直接启动 ----------
 if ($Mode -in @('auto','direct')) {
     Write-Step '尝试 2/2：直接启动 bf3.exe'
     $p = Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe) -PassThru
-    $result = Test-Launched $DirectTimeout
+    $result = Test-Launched $DirectTimeout $baselineTabs
     if ($result.Game -or $result.Battlelog) {
         Write-Host ''
         Ok '启动成功'
